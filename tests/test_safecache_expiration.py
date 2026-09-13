@@ -2,10 +2,8 @@
 # Licensed under the terms of the Apache License 2.0.
 # See LICENSE file in project root for terms.
 
-import pytest
 import time
 
-from safecache import CacheExpired
 from safecache import safecache
 
 

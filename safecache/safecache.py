@@ -14,6 +14,8 @@ from collections import namedtuple
 from copy import deepcopy
 from functools import wraps
 from hashlib import sha1
+import asyncio
+import inspect
 import os
 from threading import Event
 from threading import RLock
@@ -21,7 +23,6 @@ import tempfile
 from typing import Any
 from typing import Callable
 from typing import Dict
-from typing import List
 from typing import Text
 from typing import Tuple
 from typing import Type
@@ -36,10 +37,6 @@ try:
     import cPickle as pickle
 except ImportError:
     import pickle
-
-from .exceptions import CacheExpired
-from .exceptions import CacheMiss
-
 
 IMMUTABLE_TYPES: Tuple[Type] = (
     builtins.bool,
@@ -230,6 +227,68 @@ def safecache(
             )
 
     def impl(function):
+        if inspect.iscoroutinefunction(function):
+            @wraps(function)
+            async def async_wrapper(*entry, **kw):
+                nonlocal hits, misses
+                key: Text = sha1(pickle.dumps((*entry, kw), protocol=3)).hexdigest()
+                while True:
+                    with cache_mutex:
+                        node = cache.get(key)
+                        if (node is not None and
+                                (ttl == math.inf or node.expiry > now())):
+                            _pq_inpl_swap(pq.index(key), -1)
+                            pq.appendleft(pq.pop())
+                            hits += 1
+                            result = node.value
+                            break
+
+                        state = in_flight.get(key)
+                        if state is None:
+                            state = {
+                                "event": asyncio.Event(),
+                                "error": None,
+                            }
+                            in_flight[key] = state
+                            break
+
+                    await state["event"].wait()
+                    if state["error"] is not None:
+                        raise state["error"]
+                    continue
+
+                if node is not None and (ttl == math.inf or node.expiry > now()):
+                    return deepcopy(result) if is_mutable(result) else result
+
+                try:
+                    result = await function(*entry, **kw)
+                    result = miss_callback(result)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    node = Cache(value=result, expiry=now() + ttl)
+                    with cache_mutex:
+                        if key not in cache and len(pq) == maxsize:
+                            cache.__delitem__(pq.pop())
+                        cache[key] = node
+                        if key in pq:
+                            _pq_inpl_swap(pq.index(key), -1)
+                            pq.appendleft(pq.pop())
+                        else:
+                            pq.appendleft(key)
+                        _save_disk_cache()
+                        misses += 1
+                    return deepcopy(result) if is_mutable(result) else result
+                except BaseException as error:
+                    state["error"] = error
+                    raise
+                finally:
+                    with cache_mutex:
+                        in_flight.pop(key, None)
+                        state["event"].set()
+
+            async_wrapper.cache_info = _cache_info
+            return async_wrapper
+
         @wraps(function)
         @mutabletypeguard
         def wrapper(*entry, **kw):

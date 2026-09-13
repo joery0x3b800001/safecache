@@ -39,6 +39,19 @@ def fib(n):
 
 Once decorated, the callable will inherit the [functionality](#features) of **safecache** and begin safely caching returned results.
 
+Async callables are supported as well. The decorated function awaits the
+origin call and caches its resolved result:
+
+```python
+from safecache import safecache
+
+@safecache(ttl=60)
+async def fetch_value(value):
+    return await fetch_from_service(value)
+
+result = await fetch_value("key")
+```
+
 ## Cache Configurations
 
 | Parameter | Description | Default |

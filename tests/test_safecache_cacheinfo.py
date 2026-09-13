@@ -9,8 +9,74 @@ tests.safecache_cacheinfo
 
 import threading
 import time
+import asyncio
 
 from safecache import safecache
+
+
+def test_async_cache_awaits_and_reuses_result():
+	calls = []
+
+	@safecache()
+	async def function(value):
+		calls.append(value)
+		return {"value": value}
+
+	async def run():
+		first = await function(1)
+		second = await function(1)
+		first["value"] = 2
+		return second
+
+	assert asyncio.run(run()) == {"value": 1}
+	assert calls == [1]
+	assert function.cache_info().hits == 1
+	assert function.cache_info().misses == 1
+
+
+def test_async_concurrent_miss_only_calls_function_once():
+	calls = []
+
+	async def run():
+		started = asyncio.Event()
+		release = asyncio.Event()
+
+		@safecache()
+		async def function(value):
+			calls.append(value)
+			started.set()
+			await release.wait()
+			return value
+
+		tasks = [asyncio.create_task(function(1)) for _ in range(5)]
+		await started.wait()
+		release.set()
+		result = await asyncio.gather(*tasks)
+		return result, function
+
+	result, function = asyncio.run(run())
+	assert result == [1] * 5
+	assert calls == [1]
+	assert function.cache_info().misses == 1
+	assert function.cache_info().hits == 4
+
+
+def test_async_ttl_expires_result():
+	calls = []
+
+	@safecache(ttl=0.05)
+	async def function():
+		calls.append(None)
+		return len(calls)
+
+	async def run():
+		first = await function()
+		await asyncio.sleep(0.08)
+		second = await function()
+		return first, second
+
+	assert asyncio.run(run()) == (1, 2)
+	assert len(calls) == 2
 
 
 def test_cache_info_reports_hits_misses_and_size():

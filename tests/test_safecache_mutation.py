@@ -87,7 +87,7 @@ def f(x):
     *_SAMPLES_TUPLE,
 ))
 def test_mutabletypeguard_immutable_memid_checks(value):
-    assert id(value) == f(value)
+    assert id(value) == id(f(value))
 
 
 @pytest.mark.parametrize("value", (
@@ -95,7 +95,7 @@ def test_mutabletypeguard_immutable_memid_checks(value):
     *_SAMPLES_LIST,
     *_SAMPLES_SET,
 ))
-def test_mutabletypeguard_immutable_memid_checks(value):
+def test_mutabletypeguard_mutable_memid_checks(value):
     assert id(value) != f(value)
 
 
