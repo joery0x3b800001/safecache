@@ -14,8 +14,10 @@ from collections import namedtuple
 from copy import deepcopy
 from functools import wraps
 from hashlib import sha1
+import os
 from threading import Lock
 from threading import RLock
+import tempfile
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -133,6 +135,7 @@ def safecache(
         maxsize: int = None,
         ttl: float = math.inf,
         miss_callback: Callable = lambda _: _,
+        disk_path: Text = None,
         *a, **kw):
     """safecache decorator implementation.
 
@@ -141,6 +144,7 @@ def safecache(
     maxsize -- maximum cache entry size.
     ttl -- maximum freshness of cache entry (in seconds).
     miss_callback -- custom cache-miss callback function.
+    disk_path -- optional file path used to persist cache entries.
     """
     if maxsize is None:
         # static upper bound for None
@@ -165,6 +169,47 @@ def safecache(
         deque() if maxsize == math.inf
         else deque(maxlen=maxsize)
     )
+
+    def _load_disk_cache() -> None:
+        if disk_path is None or not os.path.exists(disk_path):
+            return
+        try:
+            with open(disk_path, "rb") as cache_file:
+                state = pickle.load(cache_file)
+            stored_cache = state["cache"]
+            stored_pq = state["pq"]
+            if not isinstance(stored_cache, dict):
+                return
+            cache.update(stored_cache)
+            pq.extend(key for key in stored_pq if key in cache)
+            if maxsize != math.inf:
+                while len(pq) > maxsize:
+                    del cache[pq.pop()]
+        except (KeyError, OSError, IOError, TypeError, ValueError, pickle.PickleError):
+            cache.clear()
+            pq.clear()
+
+    def _save_disk_cache() -> None:
+        if disk_path is None:
+            return
+        directory = os.path.dirname(os.path.abspath(disk_path))
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".safecache-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as cache_file:
+                pickle.dump({"cache": cache, "pq": list(pq)}, cache_file,
+                            protocol=3)
+            os.replace(temporary_path, disk_path)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+            raise
+
+    _load_disk_cache()
 
     def _pq_inpl_swap(i: int, j: int) -> None:
         pq[i], pq[j] = pq[j], pq[i]
@@ -205,6 +250,7 @@ def safecache(
                         cache.__delitem__(pq.pop())
                     cache.__setitem__(key, node)
                     pq.appendleft(key)
+                    _save_disk_cache()
                     misses += 1
             except CacheExpired:
                 # for expired caches, pull a version that's expected to be
@@ -215,6 +261,7 @@ def safecache(
                     cache.__setitem__(key, node)
                     _pq_inpl_swap(pq.index(key), -1)
                     pq.appendleft(pq.pop())
+                    _save_disk_cache()
                     misses += 1
             return cache.__getitem__(key).value
         wrapper.cache_info = _cache_info

@@ -12,7 +12,7 @@
 - All cached entries are **mutation-safe**.
 - All cached entries are **thread-safe**.
 - Customizable cache-miss behavior.
-- Disk caching (*in development*).
+- Optional disk caching.
 
 ## Installation
 
@@ -46,6 +46,23 @@ Once decorated, the callable will inherit the [functionality](#features) of **sa
 | `maxsize`| maximum cache entry size. | `None` |
 | `ttl`| maximum freshness of cache entry (in seconds). | `math.inf` |
 | `miss_callback` | custom cache-miss callback function (e.g. [Redis](https://redis.io) client). | `lambda _: _` |
+| `disk_path` | file path used to persist cache entries between processes. | `None` |
+
+To persist entries between processes, pass a file path to `disk_path`:
+
+```python
+from safecache import safecache
+
+@safecache(disk_path=".cache/fib.pkl")
+def fib(n):
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+```
+
+The cache file is written atomically after a miss or expiration refresh. Cache
+statistics are kept per process, while `ttl` continues to apply to persisted
+entries.
 
 ## Cache Statistics
 
