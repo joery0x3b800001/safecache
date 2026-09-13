@@ -15,7 +15,7 @@ from copy import deepcopy
 from functools import wraps
 from hashlib import sha1
 import os
-from threading import Lock
+from threading import Event
 from threading import RLock
 import tempfile
 from typing import Any
@@ -62,7 +62,13 @@ IMMUTABLE_TYPES: Tuple[Type] = (
 )
 
 
-is_immutable: Callable = lambda obj: builtins.isinstance(obj, IMMUTABLE_TYPES)
+def is_immutable(obj: Any) -> bool:
+    if not builtins.isinstance(obj, IMMUTABLE_TYPES):
+        return False
+    if builtins.isinstance(obj, (builtins.tuple, builtins.frozenset)):
+        return all(is_immutable(item) for item in obj)
+    return True
+
 
 is_mutable: Callable = lambda obj: not is_immutable(obj)
 
@@ -120,7 +126,7 @@ class CacheInfo(CacheDescriptor):
 #
 
 
-now = lambda: time.time() // 1
+now = time.time
 
 
 #
@@ -159,11 +165,11 @@ def safecache(
         # This results in zero caching and 100% fetching from origin function.
         ttl = .0
 
-    r_mutex = RLock()  # lock for cache read
-    w_mutex = Lock()   # lock for cache write
+    cache_mutex = RLock()
 
     cache: Dict = {}   # cache buffer
     hits = misses = 0  # cache stats
+    in_flight: Dict = {}
 
     pq: deque = (  # LRU priority queue
         deque() if maxsize == math.inf
@@ -215,11 +221,13 @@ def safecache(
         pq[i], pq[j] = pq[j], pq[i]
 
     def _cache_info() -> CacheInfo:
-        nonlocal hits, maxsize, misses
-        # if `cache` is accessed by multiple threads then `currsize`,
-        # although atomic, will represent near-approximate cache size.
-        currsize: int = len(cache)
-        return CacheInfo(**locals())
+        with cache_mutex:
+            return CacheInfo(
+                hits=hits,
+                misses=misses,
+                currsize=len(cache),
+                maxsize=maxsize,
+            )
 
     def impl(function):
         @wraps(function)
@@ -228,42 +236,46 @@ def safecache(
             nonlocal hits, misses
             # normalize parameters to hashable strings.
             key: Text = sha1(pickle.dumps((*entry, kw), protocol=3)).hexdigest()
+            while True:
+                with cache_mutex:
+                    node = cache.get(key)
+                    if (node is not None and
+                            (ttl == math.inf or node.expiry > now())):
+                        _pq_inpl_swap(pq.index(key), -1)
+                        pq.appendleft(pq.pop())
+                        hits += 1
+                        return node.value
+
+                    event = in_flight.get(key)
+                    if event is None:
+                        event = in_flight[key] = Event()
+                        break
+
+                event.wait()
+
             try:
-                if key not in cache:
-                    raise CacheMiss
-                # check if cache has expired. Expiration is determined from the
-                # heuristics of current time and pre-determined expiration date.
-                elif ttl != math.inf and cache.__getitem__(key).expiry <= now():
-                    raise CacheExpired
-                with r_mutex:
-                    # this swap behavior is not completely compliant with the LRU
-                    # algorithm, but was decided since intermediate "priorities"
-                    # are not as important as the end nodes (highest/lowest).
-                    _pq_inpl_swap(pq.index(key), -1)
-                    pq.appendleft(pq.pop())
-                    hits += 1
-            except CacheMiss:
-                result: Any = miss_callback(function(*entry, **kw))
+                if node is None:
+                    result: Any = miss_callback(function(*entry, **kw))
+                else:
+                    result = function(*entry, **kw)
                 node = Cache(value=result, expiry=now() + ttl)
-                with w_mutex:
-                    if len(pq) == maxsize:
+                with cache_mutex:
+                    if key not in cache and len(pq) == maxsize:
                         cache.__delitem__(pq.pop())
-                    cache.__setitem__(key, node)
-                    pq.appendleft(key)
+                    cache[key] = node
+                    if key in pq:
+                        _pq_inpl_swap(pq.index(key), -1)
+                        pq.appendleft(pq.pop())
+                    else:
+                        pq.appendleft(key)
                     _save_disk_cache()
                     misses += 1
-            except CacheExpired:
-                # for expired caches, pull a version that's expected to be
-                # fresh and update the existing cache's attributes/values.
-                result: Any = function(*entry, **kw)
-                node = Cache(value=result, expiry=now() + ttl)
-                with w_mutex:
-                    cache.__setitem__(key, node)
-                    _pq_inpl_swap(pq.index(key), -1)
-                    pq.appendleft(pq.pop())
-                    _save_disk_cache()
-                    misses += 1
-            return cache.__getitem__(key).value
+                return result
+            finally:
+                with cache_mutex:
+                    event = in_flight.pop(key, None)
+                    if event is not None:
+                        event.set()
         wrapper.cache_info = _cache_info
         return wrapper
     return impl

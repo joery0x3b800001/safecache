@@ -97,3 +97,14 @@ def test_mutabletypeguard_immutable_memid_checks(value):
 ))
 def test_mutabletypeguard_immutable_memid_checks(value):
     assert id(value) != f(value)
+
+
+def test_mutable_nested_value_inside_tuple_is_copied():
+    @mutabletypeguard
+    def function():
+        return ([1],)
+
+    result = function()
+    result[0].append(2)
+
+    assert function() == ([1],)

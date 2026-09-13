@@ -38,3 +38,24 @@ def test_disk_cache_recovers_from_invalid_file(tmp_path):
 
     assert function(10) == 10
     assert calls == [10]
+
+
+def test_disk_cache_respects_maxsize(tmp_path):
+    cache_path = str(tmp_path / "cache.pkl")
+    calls = []
+
+    @safecache(maxsize=1, disk_path=cache_path)
+    def function(value):
+        calls.append(value)
+        return value
+
+    function(1)
+    function(2)
+
+    @safecache(maxsize=1, disk_path=cache_path)
+    def restored(value):
+        calls.append(value)
+        return value
+
+    restored(1)
+    assert calls == [1, 2, 1]
