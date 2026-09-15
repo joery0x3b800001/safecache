@@ -11,6 +11,8 @@ import threading
 import time
 import asyncio
 
+import pytest
+
 from safecache import safecache
 
 
@@ -150,3 +152,124 @@ def test_fractional_ttl_is_respected():
 	time.sleep(0.08)
 	assert function() == 2
 	assert calls == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_async_ttl_regression():
+	calls = 0
+
+	@safecache(ttl=0.1)
+	async def fetch():
+		nonlocal calls
+		calls += 1
+		return calls
+
+	assert await fetch() == 1
+	assert await fetch() == 1
+	assert calls == 1
+
+	await asyncio.sleep(0.15)
+
+	assert await fetch() == 2
+	assert calls == 2
+
+	info = fetch.cache_info()
+	assert info.hits == 1
+	assert info.misses == 2
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_calls_regression():
+	calls = 0
+
+	@safecache(ttl=60)
+	async def fetch():
+		nonlocal calls
+		calls += 1
+		await asyncio.sleep(0.1)
+		return {"value": 123}
+
+	results = await asyncio.gather(
+		fetch(),
+		fetch(),
+		fetch(),
+		fetch(),
+	)
+
+	assert calls == 1
+	assert results == [
+		{"value": 123},
+		{"value": 123},
+		{"value": 123},
+		{"value": 123},
+	]
+
+	info = fetch.cache_info()
+	assert info.hits == 3
+	assert info.misses == 1
+
+
+@pytest.mark.asyncio
+async def test_async_mutable_result_isolated_regression():
+	@safecache(ttl=60)
+	async def fetch():
+		return {"value": 1}
+
+	first = await fetch()
+	first["value"] = 999
+
+	second = await fetch()
+	assert second == {"value": 1}
+
+	info = fetch.cache_info()
+	assert info.hits == 1
+	assert info.misses == 1
+
+
+@pytest.mark.asyncio
+async def test_async_exception_not_cached_regression():
+	calls = 0
+
+	@safecache(ttl=60)
+	async def fetch():
+		nonlocal calls
+		calls += 1
+		raise RuntimeError("boom")
+
+	for _ in range(2):
+		try:
+			await fetch()
+		except RuntimeError as exc:
+			assert str(exc) == "boom"
+
+	assert calls == 2
+
+	info = fetch.cache_info()
+	assert info.hits == 0
+	assert info.misses == 0
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_exception_regression():
+	calls = 0
+
+	@safecache(ttl=60)
+	async def fetch():
+		nonlocal calls
+		calls += 1
+		await asyncio.sleep(0.1)
+		raise RuntimeError("boom")
+
+	results = await asyncio.gather(
+		fetch(),
+		fetch(),
+		fetch(),
+		return_exceptions=True,
+	)
+
+	assert calls == 1
+	assert all(isinstance(result, RuntimeError) for result in results)
+
+	info = fetch.cache_info()
+	assert info.hits == 2
+	assert info.misses == 0

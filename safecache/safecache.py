@@ -230,61 +230,129 @@ def safecache(
         if inspect.iscoroutinefunction(function):
             @wraps(function)
             async def async_wrapper(*entry, **kw):
+
                 nonlocal hits, misses
-                key: Text = sha1(pickle.dumps((*entry, kw), protocol=3)).hexdigest()
-                while True:
-                    with cache_mutex:
-                        node = cache.get(key)
-                        if (node is not None and
-                                (ttl == math.inf or node.expiry > now())):
-                            _pq_inpl_swap(pq.index(key), -1)
-                            pq.appendleft(pq.pop())
-                            hits += 1
-                            result = node.value
-                            break
 
-                        state = in_flight.get(key)
-                        if state is None:
-                            state = {
-                                "event": asyncio.Event(),
-                                "error": None,
-                            }
-                            in_flight[key] = state
-                            break
+                key: Text = sha1(
+                    pickle.dumps((*entry, kw), protocol=3)
+                ).hexdigest()
 
-                    await state["event"].wait()
-                    if state["error"] is not None:
-                        raise state["error"]
-                    continue
+                with cache_mutex:
+                    node = cache.get(key)
 
-                if node is not None and (ttl == math.inf or node.expiry > now()):
-                    return deepcopy(result) if is_mutable(result) else result
+                    if (
+                        node is not None
+                        and (
+                            ttl == math.inf
+                            or node.expiry > now()
+                        )
+                    ):
+                        try:
+                            pq.remove(key)
+                        except ValueError:
+                            pass
+
+                        pq.appendleft(key)
+
+                        hits += 1
+
+                        result = node.value
+
+                        return (
+                            deepcopy(result)
+                            if is_mutable(result)
+                            else result
+                        )
+
+                    future = in_flight.get(key)
+
+                    if future is None:
+                        loop = asyncio.get_running_loop()
+                        future = loop.create_future()
+                        in_flight[key] = future
+                        owner = True
+                    else:
+                        owner = False
+
+                if not owner:
+                    try:
+                        result = await asyncio.shield(future)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException:
+                        hits += 1
+                        raise
+
+                    hits += 1
+
+                    return (
+                        deepcopy(result)
+                        if is_mutable(result)
+                        else result
+                    )
 
                 try:
                     result = await function(*entry, **kw)
+
+                    # miss_callback may be synchronous or asynchronous.
                     result = miss_callback(result)
+
                     if inspect.isawaitable(result):
                         result = await result
-                    node = Cache(value=result, expiry=now() + ttl)
+
+                    node = Cache(
+                        value=result,
+                        expiry=now() + ttl,
+                    )
+
                     with cache_mutex:
-                        if key not in cache and len(pq) == maxsize:
-                            cache.__delitem__(pq.pop())
+
+                        if (
+                            key not in cache
+                            and maxsize != math.inf
+                            and len(pq) >= maxsize
+                        ):
+                            old_key = pq.pop()
+                            cache.pop(old_key, None)
+
                         cache[key] = node
-                        if key in pq:
-                            _pq_inpl_swap(pq.index(key), -1)
-                            pq.appendleft(pq.pop())
-                        else:
-                            pq.appendleft(key)
+
+                        try:
+                            pq.remove(key)
+                        except ValueError:
+                            pass
+
+                        pq.appendleft(key)
+
                         _save_disk_cache()
+
                         misses += 1
-                    return deepcopy(result) if is_mutable(result) else result
+
+                    if not future.done():
+                        future.set_result(result)
+
+                    return (
+                        deepcopy(result)
+                        if is_mutable(result)
+                        else result
+                    )
+
                 except BaseException as error:
-                    state["error"] = error
+                    if not future.done():
+                        future.set_exception(error)
+
+                        # Avoid "Future exception was never retrieved"
+                        # if there are no waiters.
+                        future.add_done_callback(
+                            lambda f: f.exception()
+                        )
+
                     raise
+
                 finally:
                     with cache_mutex:
-                        in_flight.pop(key, None)
-                        state["event"].set()
+                        if in_flight.get(key) is future:
+                            in_flight.pop(key, None)
 
             async_wrapper.cache_info = _cache_info
             return async_wrapper
