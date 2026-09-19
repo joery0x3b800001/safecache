@@ -18,6 +18,7 @@ import asyncio
 import inspect
 import os
 from threading import Event
+from threading import Lock
 from threading import RLock
 import tempfile
 from typing import Any
@@ -168,33 +169,16 @@ def safecache(
     hits = misses = 0  # cache stats
     in_flight: Dict = {}
 
-    pq: deque = (  # LRU priority queue
-        deque() if maxsize == math.inf
-        else deque(maxlen=maxsize)
-    )
+    pq: deque = deque()  # LRU priority queue
+    disk_io_lock = Lock()
+    _log_path: Text = (disk_path + ".log") if disk_path is not None else None
+    _log_record_count = 0
 
-    def _load_disk_cache() -> None:
-        if disk_path is None or not os.path.exists(disk_path):
-            return
-        try:
-            with open(disk_path, "rb") as cache_file:
-                state = pickle.load(cache_file)
-            stored_cache = state["cache"]
-            stored_pq = state["pq"]
-            if not isinstance(stored_cache, dict):
-                return
-            cache.update(stored_cache)
-            pq.extend(key for key in stored_pq if key in cache)
-            if maxsize != math.inf:
-                while len(pq) > maxsize:
-                    del cache[pq.pop()]
-        except (KeyError, OSError, IOError, TypeError, ValueError, pickle.PickleError):
-            cache.clear()
-            pq.clear()
-
-    def _save_disk_cache() -> None:
-        if disk_path is None:
-            return
+    def _compact_disk_cache_locked(snapshot_cache: Dict, snapshot_pq: list) -> None:
+        """Rewrite disk_path as a single compact snapshot and clear the
+        log. Caller must hold disk_io_lock. Blocking -- keep off the
+        event loop."""
+        nonlocal _log_record_count
         directory = os.path.dirname(os.path.abspath(disk_path))
         if not os.path.isdir(directory):
             os.makedirs(directory)
@@ -202,8 +186,8 @@ def safecache(
             prefix=".safecache-", dir=directory)
         try:
             with os.fdopen(descriptor, "wb") as cache_file:
-                pickle.dump({"cache": cache, "pq": list(pq)}, cache_file,
-                            protocol=3)
+                pickle.dump({"cache": snapshot_cache, "pq": snapshot_pq},
+                            cache_file, protocol=3)
             os.replace(temporary_path, disk_path)
         except Exception:
             try:
@@ -211,6 +195,100 @@ def safecache(
             except OSError:
                 pass
             raise
+        try:
+            open(_log_path, "wb").close()
+        except OSError:
+            pass
+        _log_record_count = 0
+
+    def _append_disk_log(entry: Tuple, currsize: int) -> None:
+        """Append one incremental change -- ("set", key, node) or
+        ("evict", key) -- to the on-disk log. Blocking; callers must
+        already have released cache_mutex before calling this (and, for
+        the async wrapper, run it via an executor) so disk latency never
+        blocks other cache lookups."""
+        if disk_path is None:
+            return
+        nonlocal _log_record_count
+        with disk_io_lock:
+            directory = os.path.dirname(os.path.abspath(disk_path))
+            if not os.path.isdir(directory):
+                os.makedirs(directory)
+            try:
+                with open(_log_path, "ab") as log_file:
+                    pickle.dump(entry, log_file, protocol=3)
+            except (OSError, IOError, pickle.PickleError):
+                return
+            _log_record_count += 1
+            # Amortize: once the log has grown past a small multiple of
+            # the cache's own size, fold it into a fresh compact
+            # snapshot rather than letting it grow without bound.
+            if _log_record_count >= max(32, 4 * max(currsize, 1)):
+                with cache_mutex:
+                    snapshot_cache = dict(cache)
+                    snapshot_pq = list(pq)
+                try:
+                    _compact_disk_cache_locked(snapshot_cache, snapshot_pq)
+                except Exception:
+                    pass
+
+    def _load_disk_cache() -> None:
+        if disk_path is None:
+            return
+
+        loaded_any = False
+
+        if os.path.exists(disk_path):
+            try:
+                with open(disk_path, "rb") as cache_file:
+                    state = pickle.load(cache_file)
+                stored_cache = state["cache"]
+                stored_pq = state["pq"]
+                if isinstance(stored_cache, dict):
+                    cache.update(stored_cache)
+                    pq.extend(key for key in stored_pq if key in cache)
+                    loaded_any = True
+            except (KeyError, OSError, IOError, TypeError, ValueError, pickle.PickleError):
+                cache.clear()
+                pq.clear()
+
+        if os.path.exists(_log_path):
+            try:
+                with open(_log_path, "rb") as log_file:
+                    while True:
+                        try:
+                            entry = pickle.load(log_file)
+                        except EOFError:
+                            break
+                        if entry[0] == "set":
+                            _, key, node = entry
+                            cache[key] = node
+                            try:
+                                pq.remove(key)
+                            except ValueError:
+                                pass
+                            pq.appendleft(key)
+                        elif entry[0] == "evict":
+                            _, key = entry
+                            cache.pop(key, None)
+                            try:
+                                pq.remove(key)
+                            except ValueError:
+                                pass
+                loaded_any = True
+            except (OSError, IOError, TypeError, ValueError, pickle.PickleError):
+                pass
+
+        if maxsize != math.inf:
+            while len(pq) > maxsize:
+                del cache[pq.pop()]
+
+        if loaded_any:
+            with disk_io_lock:
+                try:
+                    _compact_disk_cache_locked(dict(cache), list(pq))
+                except Exception:
+                    pass
 
     _load_disk_cache()
 
@@ -305,6 +383,8 @@ def safecache(
                         expiry=now() + ttl,
                     )
 
+                    evicted_key = None
+
                     with cache_mutex:
 
                         if (
@@ -312,8 +392,8 @@ def safecache(
                             and maxsize != math.inf
                             and len(pq) >= maxsize
                         ):
-                            old_key = pq.pop()
-                            cache.pop(old_key, None)
+                            evicted_key = pq.pop()
+                            cache.pop(evicted_key, None)
 
                         cache[key] = node
 
@@ -324,9 +404,19 @@ def safecache(
 
                         pq.appendleft(key)
 
-                        _save_disk_cache()
-
                         misses += 1
+
+                        currsize = len(cache)
+
+                    if disk_path is not None:
+                        loop = asyncio.get_running_loop()
+                        if evicted_key is not None:
+                            await loop.run_in_executor(
+                                None, _append_disk_log,
+                                ("evict", evicted_key), currsize)
+                        await loop.run_in_executor(
+                            None, _append_disk_log,
+                            ("set", key, node), currsize)
 
                     if not future.done():
                         future.set_result(result)
@@ -381,22 +471,27 @@ def safecache(
                 event.wait()
 
             try:
-                if node is None:
-                    result: Any = miss_callback(function(*entry, **kw))
-                else:
-                    result = function(*entry, **kw)
+                result: Any = miss_callback(function(*entry, **kw))
                 node = Cache(value=result, expiry=now() + ttl)
+                evicted_key = None
                 with cache_mutex:
                     if key not in cache and len(pq) == maxsize:
-                        cache.__delitem__(pq.pop())
+                        evicted_key = pq.pop()
+                        cache.__delitem__(evicted_key)
                     cache[key] = node
                     if key in pq:
                         _pq_inpl_swap(pq.index(key), -1)
                         pq.appendleft(pq.pop())
                     else:
                         pq.appendleft(key)
-                    _save_disk_cache()
                     misses += 1
+                    currsize = len(cache)
+
+                if disk_path is not None:
+                    if evicted_key is not None:
+                        _append_disk_log(("evict", evicted_key), currsize)
+                    _append_disk_log(("set", key, node), currsize)
+
                 return result
             finally:
                 with cache_mutex:

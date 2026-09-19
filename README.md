@@ -73,9 +73,41 @@ def fib(n):
     return fib(n - 1) + fib(n - 2)
 ```
 
-The cache file is written atomically after a miss or expiration refresh. Cache
-statistics are kept per process, while `ttl` continues to apply to persisted
-entries.
+The cache file is written after a miss or expiration refresh. Writes are
+incremental: each miss appends a small record to `<disk_path>.log` rather
+than re-serializing the whole cache, and that log is periodically folded
+back into a compact snapshot at `disk_path` once it grows past a small
+multiple of the cache's own size. This keeps persistence at roughly O(1)
+work per miss instead of O(currsize) -- filling a large cache no longer
+means rewriting an ever-larger file on every single call. All disk I/O runs
+outside the cache's own lock (and, for `async` functions, off the event
+loop entirely via the default executor), so a slow disk only delays other
+writers to the same `disk_path`, never an ordinary cache lookup. Cache
+statistics are kept per process, while `ttl` continues to apply to
+persisted entries.
+
+Disk persistence is best-effort: a write failure is swallowed rather than
+raised, so it never breaks the in-memory cache the caller is waiting on,
+and a corrupt or truncated log tail is skipped rather than discarding
+everything that came before it. It is not, however, safe for multiple
+processes to write to the same `disk_path` *concurrently* -- there is no
+cross-process file locking, so two processes persisting at the same time
+can silently drop each other's entries. Treat `disk_path` as a
+single-writer, best-effort warm-start cache, not a shared live store.
+
+> **Important:** `disk_path` identifies the persisted cache itself, not the
+> decorated function -- entries are keyed only by their serialized call
+> arguments. Reusing the same `disk_path` for a new process running the
+> *same* logical function is exactly how cross-process persistence is meant
+> to work. But pointing **two different functions** at the same `disk_path`
+> is unsafe: if both happen to be called with arguments that serialize the
+> same way, one function's cached result can be returned for the other, and
+> each save overwrites the other's persisted state. Give every distinct
+> cached function its own `disk_path`.
+>
+> Also note that `disk_path` is trusted input: loading it uses `pickle`,
+> which can execute arbitrary code for a maliciously crafted file. Only
+> point `disk_path` at a file your own process controls.
 
 ## Cache Statistics
 
