@@ -13,6 +13,7 @@
 - All cached entries are **thread-safe**.
 - Customizable cache-miss behavior.
 - Optional disk caching.
+- Inspect a cached value directly, without invoking the wrapped function.
 
 ## Installation
 
@@ -127,6 +128,33 @@ def fib(n):
 fib(100)
 fib.cache_info()  # CacheInfo(hits=98, misses=101, maxsize=128, currsize=101)
 ```
+
+## Inspecting the Cache Without Calling the Function
+
+`.cache_get(*args, **kwargs)` looks up a call's cached value directly,
+without invoking the wrapped function. It raises `safecache.CacheMiss` if
+nothing has ever been cached for those arguments, or `safecache.CacheExpired`
+if an entry exists but its TTL has elapsed. Both are subclasses of
+`safecache.CacheError` (and of the more specific built-in `KeyError` /
+`ValueError`, respectively), so either can be caught narrowly or together.
+A successful lookup counts as a hit and updates the LRU order, exactly like
+a normal call would:
+
+```python
+from safecache import safecache, CacheError
+
+@safecache(ttl=60)
+def fib(n):
+    if n <= 1:
+        return n
+    return fib(n-1) + fib(n-2)
+
+try:
+    fib.cache_get(10)
+except CacheError:
+    fib(10)  # populate it
+```
+
 ## Why safecache?
 
 [Caching](https://en.wikipedia.org/wiki/Cache_(computing)) using native Python can be useful to minimize the caching latency (e.g. [dynamic programming problems](https://en.wikipedia.org/wiki/Dynamic_programming#Examples:_Computer_algorithms)), but it could be used or implemented incorrectly to result in inconsistent caching behaviors and bugs. For example, here is a scenario where one needs object integrity - but does not have that guarantee due to cache contamination.

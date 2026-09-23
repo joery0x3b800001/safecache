@@ -7,6 +7,7 @@ safecache
 =========
 """
 
+from .exceptions import CacheError
 from .exceptions import CacheExpired
 from .exceptions import CacheMiss
 

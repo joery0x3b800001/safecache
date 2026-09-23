@@ -39,6 +39,9 @@ try:
 except ImportError:
     import pickle
 
+from .exceptions import CacheExpired
+from .exceptions import CacheMiss
+
 IMMUTABLE_TYPES: Tuple[Type] = (
     builtins.bool,
     builtins.bytes,
@@ -304,6 +307,30 @@ def safecache(
                 maxsize=maxsize,
             )
 
+    def _cache_get(*entry, **kw) -> Any:
+        """Look up a call's cached value without invoking the wrapped
+        function. Raises CacheMiss if nothing has ever been cached for
+        these arguments, or CacheExpired if a cached entry exists but its
+        TTL has elapsed. A successful lookup counts as a hit and moves the
+        entry to the front of the LRU queue, exactly like a normal call.
+        """
+        nonlocal hits
+        key: Text = sha1(pickle.dumps((*entry, kw), protocol=3)).hexdigest()
+        with cache_mutex:
+            node = cache.get(key)
+            if node is None:
+                raise CacheMiss(key)
+            if ttl != math.inf and node.expiry <= now():
+                raise CacheExpired(key)
+            try:
+                pq.remove(key)
+            except ValueError:
+                pass
+            pq.appendleft(key)
+            hits += 1
+            value = node.value
+        return deepcopy(value) if is_mutable(value) else value
+
     def impl(function):
         if inspect.iscoroutinefunction(function):
             @wraps(function)
@@ -445,6 +472,7 @@ def safecache(
                             in_flight.pop(key, None)
 
             async_wrapper.cache_info = _cache_info
+            async_wrapper.cache_get = _cache_get
             return async_wrapper
 
         @wraps(function)
@@ -499,5 +527,6 @@ def safecache(
                     if event is not None:
                         event.set()
         wrapper.cache_info = _cache_info
+        wrapper.cache_get = _cache_get
         return wrapper
     return impl
