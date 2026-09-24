@@ -61,6 +61,7 @@ result = await fetch_value("key")
 | `ttl`| maximum freshness of cache entry (in seconds). | `math.inf` |
 | `miss_callback` | custom cache-miss callback function (e.g. [Redis](https://redis.io) client). | `lambda _: _` |
 | `disk_path` | file path used to persist cache entries between processes. | `None` |
+| `disk_compact_after` | cap, in records, on how large `disk_path`'s on-disk log can grow before it's folded into a snapshot. `None` uses the adaptive `max(32, 4 * currsize)` threshold. | `None` |
 
 To persist entries between processes, pass a file path to `disk_path`:
 
@@ -86,6 +87,31 @@ loop entirely via the default executor), so a slow disk only delays other
 writers to the same `disk_path`, never an ordinary cache lookup. Cache
 statistics are kept per process, while `ttl` continues to apply to
 persisted entries.
+
+The default compaction threshold (`max(32, 4 * currsize)`) scales with the
+cache's own size. That's fine for a typical cache, but if `maxsize` is
+large while only a small hot subset of keys is actually being refreshed
+(e.g. under a short `ttl`), the log can grow well past what the live key
+count would suggest before it's ever folded down -- currsize includes
+every key, not just the ones churning. Pass `disk_compact_after` to cap
+the log at a fixed number of records regardless of `currsize`:
+
+```python
+@safecache(disk_path=".cache/fib.pkl", maxsize=5000, ttl=30,
+           disk_compact_after=200)
+def fib(n):
+    ...
+```
+
+Two levers, two different jobs: `maxsize` bounds how many entries are
+kept at all (evicting the least-recently-used ones); `disk_compact_after`
+bounds how large the *uncompacted log* is allowed to get in between
+snapshots, independent of how many entries are currently live. Note that
+`ttl` on its own does not shrink anything -- an expired entry just sits in
+the cache (and on disk) until it's either looked up again or evicted by
+`maxsize` pressure, so unbounded, high-cardinality keys will grow both the
+in-memory cache and its disk persistence without bound unless `maxsize`
+is set.
 
 Disk persistence is best-effort: a write failure is swallowed rather than
 raised, so it never breaks the in-memory cache the caller is waiting on,

@@ -143,6 +143,48 @@ def test_disk_cache_log_stays_bounded_for_a_stable_key_set(tmp_path):
     assert log_size < 8000
 
 
+def test_disk_compact_after_caps_log_growth_independent_of_maxsize(tmp_path):
+    """The adaptive compaction threshold (max(32, 4*currsize)) scales
+    with the cache's own size, so a large maxsize with only a small hot
+    subset under a short ttl can let the log grow much larger than the
+    live key count would suggest before it's ever folded down.
+    disk_compact_after caps that regardless of currsize.
+    """
+    import os
+    import time
+
+    cache_path = str(tmp_path / "cache.pkl")
+
+    @safecache(maxsize=5000, ttl=0.005, disk_path=cache_path,
+               disk_compact_after=50)
+    def f(x):
+        return x
+
+    for i in range(1000):
+        f(("filler", i))  # push currsize up with a large, distinct set
+
+    for round_ in range(300):
+        f(round_ % 5)  # small hot subset, repeatedly refreshed
+        time.sleep(0.0002)
+
+    log_path = cache_path + ".log"
+    log_size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    assert log_size < 20000
+
+
+def test_disk_compact_after_negative_is_normalized(tmp_path):
+    cache_path = str(tmp_path / "cache.pkl")
+
+    @safecache(disk_path=cache_path, disk_compact_after=-5)
+    def f(x):
+        return x
+
+    for i in range(5):
+        f(i)
+
+    assert f.cache_info().currsize == 5
+
+
 def test_disk_cache_write_does_not_block_event_loop(tmp_path):
     """The disk write for an async-decorated function must run off the
     event loop thread, not synchronously inside the coroutine, so a slow

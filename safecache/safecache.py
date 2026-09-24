@@ -143,6 +143,7 @@ def safecache(
         ttl: float = math.inf,
         miss_callback: Callable = lambda _: _,
         disk_path: Text = None,
+        disk_compact_after: int = None,
         *a, **kw):
     """safecache decorator implementation.
 
@@ -152,6 +153,16 @@ def safecache(
     ttl -- maximum freshness of cache entry (in seconds).
     miss_callback -- custom cache-miss callback function.
     disk_path -- optional file path used to persist cache entries.
+    disk_compact_after -- optional cap, in records, on how large
+        `disk_path`'s on-disk log is allowed to grow before it's folded
+        back into a compact snapshot. The log is normally folded at
+        max(32, 4 * currsize), which scales with the cache's own size --
+        fine when maxsize is small, but if maxsize is large while only a
+        small hot subset of keys is actually being refreshed (e.g. under
+        a short ttl), that adaptive threshold can let the log grow much
+        larger than the live key count would suggest. Set
+        disk_compact_after to put a fixed ceiling on it regardless of
+        currsize. Ignored when disk_path is None.
     """
     if maxsize is None:
         # static upper bound for None
@@ -165,6 +176,9 @@ def safecache(
         # negative time-to-live (ttl) is normalized to "always-revalidate" state.
         # This results in zero caching and 100% fetching from origin function.
         ttl = .0
+
+    if disk_compact_after is not None and disk_compact_after < 0:
+        disk_compact_after = 0
 
     cache_mutex = RLock()
 
@@ -225,8 +239,16 @@ def safecache(
             _log_record_count += 1
             # Amortize: once the log has grown past a small multiple of
             # the cache's own size, fold it into a fresh compact
-            # snapshot rather than letting it grow without bound.
-            if _log_record_count >= max(32, 4 * max(currsize, 1)):
+            # snapshot rather than letting it grow without bound. This
+            # adaptive threshold scales with currsize, so it's capped by
+            # disk_compact_after when that's set -- otherwise a large
+            # maxsize with a small, repeatedly-refreshed hot subset can
+            # let the log grow much larger than the live key count would
+            # suggest before it's ever folded down.
+            threshold = max(32, 4 * max(currsize, 1))
+            if disk_compact_after is not None:
+                threshold = min(threshold, disk_compact_after)
+            if _log_record_count >= threshold:
                 with cache_mutex:
                     snapshot_cache = dict(cache)
                     snapshot_pq = list(pq)
